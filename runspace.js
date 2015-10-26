@@ -70,6 +70,7 @@ function Runspace(scope, options) {
     self.allow = options.allow || [];
     self.deny = options.deny || [];
     self.moduleLoader = new ModuleLoader(self);
+    self.processEE = new EventEmitter();
 
     var listeners = new Map();
     var timerCallbacks = {
@@ -84,9 +85,12 @@ function Runspace(scope, options) {
 
     // setup proxies of built-in modules
     self.add(EventEmitter, {
-        call: function (method, args, target, undef) {
+        call: function (method, fn, args, target, undef) {
             if (self.isWeaklyProxied(target)) {
                 return;
+            }
+            if (target === process) {
+                return undef.wrap(fn.apply(self.processEE, args));
             }
             if (!listeners.has(target)) {
                 listeners.set(target, []);
@@ -115,7 +119,7 @@ function Runspace(scope, options) {
                     callback: callback,
                     callbackProxy: callbackProxy
                 });
-                return undef.wrap(target[method.substr(13)](eventType, callbackProxy));
+                return undef.wrap(fn.call(target, eventType, callbackProxy));
             case 'EventEmitter#removeListener':
             case 'EventEmitter#removeAllListener':
                 var checkType = method.indexOf('All') < 0 || eventType;
@@ -153,7 +157,7 @@ function Runspace(scope, options) {
         functionType: 'ctor'
     });
     self.timers = self.add(timers, {
-        call: function (method, args, obj, undef) {
+        call: function (method, fn, args, target, undef) {
             var arr = timerCallbacks[method.substr(method.charAt(0) === 's' ? 3 : 5).toLowerCase()];
             if (method.charAt(0) === 's') {
                 if (method !== 'setInterval') {
@@ -168,7 +172,7 @@ function Runspace(scope, options) {
                         }
                     };
                 }
-                var handle = global[method].apply(null, args);
+                var handle = fn.apply(null, args);
                 if (method !== 'setImmediate') {
                     handle.unref();
                 }
@@ -179,8 +183,7 @@ function Runspace(scope, options) {
                 if (idx >= 0) {
                     arr.splice(idx, 1);
                 }
-                global[method].apply(null, args);
-                return undef;
+                return undef.wrap(fn.apply(null, args));
             }
         }
     });
@@ -193,16 +196,36 @@ function Runspace(scope, options) {
 
     self.context.process = self.add(process, {
         name: 'process',
-        deny: ['abort', 'binding', 'chdir', 'dlopen', 'exit', 'setgid', 'setegid', 'setuid', 'seteuid', 'setgroups', 'initgroups', 'kill', 'disconnect', 'mainModule']
+        deny: ['stdin', 'abort', 'binding', 'chdir', 'dlopen', 'exit', 'setgid', 'setegid', 'setuid', 'seteuid', 'setgroups', 'initgroups', 'kill', 'disconnect', 'mainModule'],
+        call: function (method, fn, args, target, undef) {
+            if (method === 'send') {
+                var message = JSON.parse(JSON.stringify(args[0]));
+                self.emit('message', message);
+                return undef;
+            }
+            if (method === 'cwd') {
+                return self.scope;
+            }
+        }
     });
     self.fs = self.add(fs, {
         name: 'fs',
-        call: function (method, args) {
+        call: function (method, fn, args) {
             if (fsArgCheck[method] & 1) {
+                args[0] = path.resolve(self.scope, args[0]);
                 throwIfEAcces(self.scope, args[0]);
             }
             if (fsArgCheck[method] & 2) {
+                args[1] = path.resolve(self.scope, args[1]);
                 throwIfEAcces(self.scope, args[1]);
+            }
+        }
+    });
+    self.add(path, {
+        name: 'path',
+        call: function (method, fn, args) {
+            if (method === 'resolve') {
+                args.unshift(self.scope);
             }
         }
     });
@@ -211,7 +234,13 @@ function Runspace(scope, options) {
     // by accessing internal V8 CallSite objects
     vm.runInContext('Object.defineProperty(Error, \'prepareStackTrace\', { value: undefined })', self.context);
 
+    function forwardExit() {
+        self.processEE.emit('exit');
+    }
+    process.on('exit', forwardExit);
     self.once('terminate', function () {
+        process.removeListener('exit', forwardExit);
+        self.processEE.emit('exit');
         timerCallbacks.immediate.forEach(clearImmediate);
         timerCallbacks.interval.forEach(clearInterval);
         timerCallbacks.timeout.forEach(clearTimeout);
@@ -231,6 +260,11 @@ util.inherits(Runspace, Proxy);
 
 Runspace.prototype.isPathAllowed = function (path) {
     return isContained(this.scope, path);
+};
+
+Runspace.prototype.send = function (message) {
+    message = JSON.parse(JSON.stringify(message));
+    this.processEE.emit('message', message);
 };
 
 Runspace.prototype.compileScript = function (code, filename) {

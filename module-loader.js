@@ -217,7 +217,6 @@ module.exports = function ModuleLoader(runspace) {
         }
     };
     this.pathCache = {};
-    this.pathCache = {};
     this.Module = Module;
     this.requireAt = function (dirname) {
         dirname = path.resolve(dirname);

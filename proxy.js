@@ -51,7 +51,7 @@ function defineConstructor(obj, constructor) {
 function createNamedFunction(name, fn) {
     /* jshint -W054 */
     if (!name) {
-        return fn || function () {};
+        return fn || returnThis;
     }
     if (!namedFnGen[name]) {
         namedFnGen[name] = new Function('fn', 'return function ' + (name || '') + '() { return fn.apply(this, arguments); }');
@@ -121,8 +121,15 @@ function createProxy(host, target, options, map) {
             if (!(obj instanceof ctor)) {
                 // constructor directly called by user space
                 // called the original constructor and wrap with our proxy constructor
+                var args = slice.call(arguments);
+                if (options.new) {
+                    var value = options.new(name, ctor, args, undef);
+                    if (value !== undefined) {
+                        return wrapObject(undef.unwrap(value));
+                    }
+                }
                 var target = Object.create(ctor.prototype);
-                ctor.apply(target, arguments);
+                ctor.apply(target, args);
                 return new CtorProxy(target);
             }
             defineProperties(this, obj, map, name + '#');
@@ -156,7 +163,7 @@ function createProxy(host, target, options, map) {
                 return v;
             });
             if (options.call) {
-                var value = options.call(name, args, context, undef);
+                var value = options.call(name, fn, args, context, undef);
                 if (value !== undefined) {
                     return argsOut(undef.unwrap(value));
                 }
