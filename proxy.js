@@ -12,6 +12,21 @@ var reBeforeDot = /^.*(\.|#)/;
 var namedFnGen = {};
 var internalAccess;
 
+var DONT_PROXY = [
+    Object,
+    Array,
+    Buffer,
+    Int8Array,
+    Int16Array,
+    Int32Array,
+    Uint8Array,
+    Uint8ClampedArray,
+    Uint16Array,
+    Uint32Array,
+    Float64Array,
+    ArrayBuffer
+];
+
 var undef = Object.freeze({
     wrap: function (v) {
         return v === undefined ? undef : v;
@@ -66,19 +81,17 @@ function createNamedObject(name, prototype) {
 }
 
 function createProxy(host, target, options, map) {
-    var tempMap = host._tempMap;
-    var permMap = host._permMap;
     options = options || {};
 
     function wrapObject(obj) {
-        if (obj && typeof obj === 'object') {
-            return permMap.get(obj) || tempMap.get(obj) || (permMap.has(obj.constructor) && new(permMap.get(obj.constructor))(obj)) || obj;
+        if (obj && (typeof obj === 'object' || typeof obj === 'function')) {
+            return host.getProxy(obj) || (host.getProxy(obj.constructor) && new(host.getProxy(obj.constructor))(obj)) || obj;
         }
         return obj;
     }
 
     function unwrapObject(obj) {
-        if (obj && typeof obj === 'object' && hasOwnProperty(obj, '__proxyTarget__')) {
+        if (obj && (typeof obj === 'object' || typeof obj === 'function') && hasOwnProperty(obj, '__proxyTarget__')) {
             try {
                 internalAccess = true;
                 return obj.__proxyTarget__;
@@ -101,9 +114,9 @@ function createProxy(host, target, options, map) {
 
     function createPrototypedObject(obj, name, map) {
         var proto = Object.getPrototypeOf(obj);
-        if (proto && proto.constructor !== Object) {
+        if (proto && DONT_PROXY.indexOf(proto.constructor) < 0) {
             if (proto.constructor.prototype === proto) {
-                var CtorProxy = permMap.get(proto.constructor) || createCtorFunction(proto.constructor);
+                var CtorProxy = host.getProxy(proto.constructor) || createCtorFunction(proto.constructor);
                 if (proto instanceof proto.constructor) {
                     return new CtorProxy(proto, map);
                 }
@@ -115,6 +128,9 @@ function createProxy(host, target, options, map) {
     }
 
     function createCtorFunction(ctor, name, map) {
+        if (DONT_PROXY.indexOf(ctor) >= 0) {
+            throw new Error('Constructor \'' + ctor.name + '\' cannot be proxied');
+        }
         name = ctor.name || name;
         var CtorProxy = createNamedFunction(name, function (obj, map) {
             host.throwIfTerminated();
@@ -135,16 +151,17 @@ function createProxy(host, target, options, map) {
             defineProperties(this, obj, map, name + '#');
             return this;
         });
-        defineProperties(CtorProxy, ctor, map || permMap, name + '.');
+        defineProperties(CtorProxy, ctor, map || host._permMap, name + '.');
 
         // setting up prototype of the constructor
-        CtorProxy.prototype = createPrototypedObject(ctor.prototype, name, map || permMap);
+        CtorProxy.prototype = createPrototypedObject(ctor.prototype, name, map || host._permMap);
         defineConstructor(CtorProxy.prototype, CtorProxy);
-        defineProperties(CtorProxy.prototype, ctor.prototype, map || permMap, name + '#');
+        defineProperties(CtorProxy.prototype, ctor.prototype, map || host._permMap, name + '#');
         return CtorProxy;
     }
 
     function createFunction(name, fn, argsIn, argsOut) {
+        name = name || fn.name;
         var prop = name.replace(reBeforeDot, '');
         var assert = createAssertion(name, 'Function call to %s() is blocked');
         return createNamedFunction(prop, function () {
@@ -215,7 +232,8 @@ function createProxy(host, target, options, map) {
     }
 
     function defineProperties(proxy, target, map, ns) {
-        (map || tempMap).set(target, proxy);
+        map = map || host._tempMap;
+        map.set(target, proxy);
         Object.defineProperty(proxy, '__proxyTarget__', {
             get: function () {
                 if (internalAccess) {
@@ -224,7 +242,9 @@ function createProxy(host, target, options, map) {
             }
         });
         Object.getOwnPropertyNames(target).forEach(function (prop) {
-            if (prop === '__proto__' || prop === 'constructor' || (Object.getOwnPropertyDescriptor(proxy, prop) || {}).configurable === false) {
+            if ((prop === '__proto__' || prop === 'constructor') ||
+                (Object.getOwnPropertyDescriptor(proxy, prop) || {}).configurable === false ||
+                (!global.WeakMap && prop === host._tempMap.__weakMapData__)) {
                 return;
             }
 
@@ -235,7 +255,7 @@ function createProxy(host, target, options, map) {
                 // assume function from a captialized property is a constructor
                 // but do not process the same constructor again
                 Object.defineProperty(proxy, prop, {
-                    value: permMap.get(target[prop]) || createCtorFunction(target[prop], prop),
+                    value: host.getProxy(target[prop]) || createCtorFunction(target[prop], prop),
                     writable: true,
                     configurable: descriptor.configurable,
                     enumerable: descriptor.enumerable
@@ -254,10 +274,10 @@ function createProxy(host, target, options, map) {
                     get: function () {
                         var value = target[prop];
                         if (typeof value === 'function') {
-                            if (!permMap.has(value)) {
-                                permMap.set(value, createInFunction(nsprop, value));
+                            if (!map.has(value)) {
+                                map.set(value, createInFunction(nsprop, value));
                             }
-                            return permMap.get(value);
+                            return map.get(value);
                         }
                         return getter();
                     },
@@ -300,9 +320,9 @@ function createProxy(host, target, options, map) {
             return createCtorFunction(target, options.name, map);
         }
         if (options.functionType === 'out') {
-            return createOutFunction(options.name || target.name, target);
+            return createOutFunction(options.name, target);
         }
-        return createInFunction(options.name || target.name, target);
+        return createInFunction(options.name, target);
     }
     var proxy = createPrototypedObject(target, options.name, map);
     defineProperties(proxy, target, map);

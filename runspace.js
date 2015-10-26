@@ -153,9 +153,6 @@ function Runspace(scope, options) {
         functionType: 'ctor',
         deny: ['#ref']
     });
-    self.add(setImmediateCtor, {
-        functionType: 'ctor'
-    });
     self.timers = self.add(timers, {
         call: function (method, fn, args, target, undef) {
             var arr = timerCallbacks[method.substr(method.charAt(0) === 's' ? 3 : 5).toLowerCase()];
