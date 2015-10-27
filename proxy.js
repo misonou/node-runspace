@@ -7,7 +7,6 @@ var util = require('util');
 var Map = require('./map');
 var WeakMap = require('./weak-map');
 
-var slice = Array.prototype.slice;
 var reBeforeDot = /^.*(\.|#)/;
 var namedFnGen = {};
 var internalAccess;
@@ -36,9 +35,13 @@ var undef = Object.freeze({
     }
 });
 
-function returnThis() {
-    /*jshint -W040 */
-    return this;
+function slice() {
+    var length = arguments.length;
+    var arr = new Array(length);
+    for (var i = 0; i < length; i++) {
+        arr[i] = arguments[i];
+    }
+    return arr;
 }
 
 function hasOwnProperty(obj, prop) {
@@ -48,7 +51,7 @@ function hasOwnProperty(obj, prop) {
     return Object.prototype.hasOwnProperty.call(obj, prop);
 }
 
-function throwError(target, prop, message) {
+function throwEAcces(target, prop, message) {
     var name = ((target !== null && target !== undefined && target.constructor.name) || '').replace(/(.)$/, '$1.') + prop;
     var err = new Error(util.format(message || 'Access to property %s is blocked', name));
     err.code = 'EACCES';
@@ -65,13 +68,11 @@ function defineConstructor(obj, constructor) {
 
 function createNamedFunction(name, fn) {
     /* jshint -W054 */
-    if (!name) {
-        return fn || returnThis;
-    }
+    name = name || '';
     if (!namedFnGen[name]) {
         namedFnGen[name] = new Function('fn', 'return function ' + (name || '') + '() { return fn.apply(this, arguments); }');
     }
-    return namedFnGen[name](fn || returnThis);
+    return namedFnGen[name](fn || function () {});
 }
 
 function createNamedObject(name, prototype) {
@@ -106,57 +107,66 @@ function createProxy(host, target, options, map) {
         if ((Array.isArray(options.deny) && options.deny.indexOf(prop) >= 0) ||
             (Array.isArray(options.allow) && options.allow.indexOf(prop) < 0)) {
             return function () {
-                throwError(this, prop, message);
+                throwEAcces(this, prop, message);
             };
         }
         return function () {};
     }
 
-    function createPrototypedObject(obj, name, map) {
+    function createObject(obj, name, map, ns) {
         var proto = Object.getPrototypeOf(obj);
         if (proto && DONT_PROXY.indexOf(proto.constructor) < 0) {
-            if (proto.constructor.prototype === proto) {
-                var CtorProxy = host.getProxy(proto.constructor) || createCtorFunction(proto.constructor);
-                if (proto instanceof proto.constructor) {
-                    return new CtorProxy(proto, map);
-                }
-                return createNamedObject(name, CtorProxy.prototype);
+            var CtorProxy = host.getProxy(proto.constructor) || createCtorFunction(proto.constructor);
+            if (proto.constructor.prototype !== proto) {
+                // this prototype object is not new'd and assigned to the constructor
+                // but is the original prototype object with __proto__ modified
+                proto = createObject(proto, proto.constructor.name, map);
+                defineConstructor(proto, CtorProxy);
+            } else if (proto instanceof proto.constructor) {
+                proto = new CtorProxy(proto, map);
+            } else {
+                proto = CtorProxy.prototype;
             }
-            return createPrototypedObject(proto, proto.constructor.name, map);
         }
-        return createNamedObject(name);
+        var proxy = createNamedObject(name, proto);
+        defineProperties(proxy, obj, map, ns);
+        return proxy;
     }
 
     function createCtorFunction(ctor, name, map) {
+        name = ctor.name || name || '';
         if (DONT_PROXY.indexOf(ctor) >= 0) {
-            throw new Error('Constructor \'' + ctor.name + '\' cannot be proxied');
+            throw new Error('Constructor \'' + name + '\' cannot be proxied');
         }
-        name = ctor.name || name;
-        var CtorProxy = createNamedFunction(name, function (obj, map) {
+        var CtorProxy = createNamedFunction(name, function () {
             host.throwIfTerminated();
-            if (!(obj instanceof ctor)) {
-                // constructor directly called by user space
-                // called the original constructor and wrap with our proxy constructor
-                var args = slice.call(arguments);
+            var target, map;
+            if (!arguments.length || !(arguments[0] instanceof ctor)) {
+                // called from sandbox with arguments
+                // call original constructor to create new instance
+                // sandbox created instance must be weak-referenced
+                var args = slice.apply(null, arguments);
                 if (options.new) {
                     var value = options.new(name, ctor, args, undef);
                     if (value !== undefined) {
                         return wrapObject(undef.unwrap(value));
                     }
                 }
-                var target = Object.create(ctor.prototype);
+                target = Object.create(ctor.prototype);
                 ctor.apply(target, args);
-                return new CtorProxy(target);
+            } else {
+                // called internally with existing instance outside
+                // second parameter is the preferred map if supplied
+                target = arguments[0];
+                map = arguments.length > 1 && arguments[1];
             }
-            defineProperties(this, obj, map, name + '#');
-            return this;
+            defineProperties(this, target, map, name + '#');
         });
         defineProperties(CtorProxy, ctor, map || host._permMap, name + '.');
 
         // setting up prototype of the constructor
-        CtorProxy.prototype = createPrototypedObject(ctor.prototype, name, map || host._permMap);
+        CtorProxy.prototype = createObject(ctor.prototype, name, map || host._permMap, name + '#');
         defineConstructor(CtorProxy.prototype, CtorProxy);
-        defineProperties(CtorProxy.prototype, ctor.prototype, map || host._permMap, name + '#');
         return CtorProxy;
     }
 
@@ -168,12 +178,12 @@ function createProxy(host, target, options, map) {
             host.throwIfTerminated();
             assert();
             var context = argsIn(this);
-            var args = slice.call(arguments).map(function (v) {
+            var args = slice.apply(null, arguments).map(function (v) {
                 v = argsIn(v);
                 if (typeof v === 'function') {
                     return function () {
                         var context = argsOut(this);
-                        var args = slice.call(arguments).map(argsOut);
+                        var args = slice.apply(null, arguments).map(argsOut);
                         return argsIn(v.apply(context, args));
                     };
                 }
@@ -242,9 +252,8 @@ function createProxy(host, target, options, map) {
             }
         });
         Object.getOwnPropertyNames(target).forEach(function (prop) {
-            if ((prop === '__proto__' || prop === 'constructor') ||
-                (Object.getOwnPropertyDescriptor(proxy, prop) || {}).configurable === false ||
-                (!global.WeakMap && prop === host._tempMap.__weakMapData__)) {
+            if ((prop === '__proto__' || prop === 'constructor' || prop.substr(0, 9) === '$weakMap$') ||
+                (Object.getOwnPropertyDescriptor(proxy, prop) || {}).configurable === false) {
                 return;
             }
 
@@ -292,7 +301,7 @@ function createProxy(host, target, options, map) {
                             return;
                         }
                         if (typeof target[prop] === 'function') {
-                            throwError(this, prop, 'Writing to property %s is blocked');
+                            throwEAcces(this, prop, 'Writing to property %s is blocked');
                         }
                         setter(value);
                     },
@@ -324,9 +333,7 @@ function createProxy(host, target, options, map) {
         }
         return createInFunction(options.name, target);
     }
-    var proxy = createPrototypedObject(target, options.name, map);
-    defineProperties(proxy, target, map);
-    return proxy;
+    return createObject(target, options.name, map);
 }
 
 function Proxy() {
