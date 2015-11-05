@@ -27,11 +27,9 @@ Below is an exhausive list of options, with the default value shown.
 
 ```javascript
 {
-    // list of modules outside allowed sandbox's root path
-    allow: [],
-
-    // list of built-in modules which access shall be denied
-    deny: []
+    // list of whitelist paths which scripts
+    // inside sandbox can load modules from
+    loadPaths: []
 }
 ```
 

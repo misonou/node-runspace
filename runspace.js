@@ -67,9 +67,10 @@ function Runspace(scope, options) {
 
     var self = this;
     self.scope = path.resolve(scope);
-    self.allow = options.allow || [];
-    self.deny = options.deny || [];
-    self.moduleLoader = new ModuleLoader(self);
+    self.moduleLoader = new ModuleLoader(self, {
+        deny: ['cluster', 'child_process', 'repl'],
+        loadPaths: options.loadPaths
+    });
     self.processEE = new EventEmitter();
 
     var listeners = new Map();

@@ -96,15 +96,21 @@ function requireAt(runspace, loader, dir, parent) {
     function resolveNodeModules(id, exts) {
         var paths = lookupPaths[dir];
         if (!paths) {
-            paths = lookupPaths[dir] = Module._nodeModulePaths(dir).concat(Module.globalPaths);
+            if (nocheck) {
+                paths = lookupPaths[dir] = Module._nodeModulePaths(dir).concat(Module.globalPaths);
+            } else {
+                var filter = runspace.isPathAllowed.bind(runspace);
+                paths = lookupPaths[dir] = [];
+                paths.push.apply(paths, Module._nodeModulePaths(dir).filter(filter));
+                paths.push.apply(paths, loader.loadPaths);
+                paths.push.apply(paths, Module.globalPaths.filter(filter));
+            }
         }
         for (var i = 0, length = paths.length; i < length; i++) {
             var modulePath = path.join(paths[i], id);
             var filename = tryFile(modulePath, exts) || tryDirectory(modulePath, exts);
             if (filename) {
-                if (nocheck || runspace.isPathAllowed(paths[i]) || runspace.allow.indexOf(id) >= 0) {
-                    return filename;
-                }
+                return filename;
             }
         }
         throwError('MODULE_NOT_FOUND', 'Cannot find module \'%s\'', id);
@@ -135,7 +141,7 @@ function requireAt(runspace, loader, dir, parent) {
             filename = pathCache[id] = resolveFilename(id);
         }
         if (builtInModules.indexOf(filename) >= 0) {
-            if (runspace.deny.indexOf(filename) >= 0) {
+            if (loader.deny.indexOf(filename) >= 0) {
                 throwError('EACCES', 'Access denied to module \'%s\'', id);
             }
             var m = realRequire(filename);
@@ -191,7 +197,7 @@ function loadNative(runspace, module, filename) {
     module.exports = process.dlopen(module, filename);
 }
 
-module.exports = function ModuleLoader(runspace) {
+module.exports = function ModuleLoader(runspace, options) {
     function Module(id, parent) {
         this.id = id;
         this.exports = {};
@@ -216,6 +222,8 @@ module.exports = function ModuleLoader(runspace) {
             loadNative(runspace, module, filename);
         }
     };
+    this.deny = options.deny || [];
+    this.loadPaths = options.loadPaths || [];
     this.pathCache = {};
     this.Module = Module;
     this.requireAt = function (dirname) {
