@@ -5,6 +5,7 @@
 var EventEmitter = require('events').EventEmitter;
 var fs = require('fs');
 var path = require('path');
+var stream = require('stream');
 var timers = require('timers');
 var util = require('util');
 var vm = require('vm');
@@ -32,6 +33,10 @@ var GLOBALS = {
     Float64Array: Float64Array,
     ArrayBuffer: ArrayBuffer
 };
+var PROCESS_DENY = ['abort', 'binding', 'chdir', 'dlopen', 'exit', 'setgid', 'setegid', 'setuid', 'seteuid', 'setgroups', 'initgroups', 'kill', 'disconnect', 'mainModule'];
+Array.prototype.push.apply(PROCESS_DENY, Object.getOwnPropertyNames(process).filter(function (v) {
+    return v.charAt(0) === '_';
+}));
 
 var fsArgCheck = {};
 Object.getOwnPropertyNames(fs).forEach(function (i) {
@@ -61,6 +66,32 @@ function throwIfEAcces(basedir, filename) {
     }
 }
 
+function Pipe() {
+    var self = this;
+    var queue = [];
+    self.readable = new stream.Readable({
+        read: function () {
+            while (queue[0] && this.push(queue.shift()));
+        }
+    });
+    self.writable = new stream.Writable({
+        write: function (data, encoding, callback) {
+            var err = null;
+            try {
+                if (self.readable.listenerCount('data') > 0) {
+                    if (!(data instanceof Buffer)) {
+                        data = new Buffer(data, encoding);
+                    }
+                    queue.push(data);
+                }
+            } catch (ex) {
+                err = ex;
+            }
+            callback(err);
+        }
+    });
+}
+
 function Runspace(scope, options) {
     Proxy.call(this);
     options = options || {};
@@ -71,18 +102,20 @@ function Runspace(scope, options) {
         deny: ['cluster', 'child_process', 'repl'],
         loadPaths: options.loadPaths
     });
-    self.processEE = new EventEmitter();
 
+    var processEE = new EventEmitter();
     var listeners = new Map();
     var timerCallbacks = {
         immediate: [],
         interval: [],
         timeout: []
     };
-
-    // setup global context in user-code space
-    self.context = vm.createContext(GLOBALS);
-    self.context.global = self.context;
+    var stdin = new Pipe();
+    var stdout = new Pipe();
+    var stderr = new Pipe();
+    self.stdin = stdin.writable;
+    self.stdout = stdout.readable;
+    self.stderr = stderr.readable;
 
     // setup proxies of built-in modules
     self.add(EventEmitter, {
@@ -91,7 +124,7 @@ function Runspace(scope, options) {
                 return;
             }
             if (target === process) {
-                return undef.wrap(fn.apply(self.processEE, args));
+                return undef.wrap(fn.apply(processEE, args));
             }
             if (!listeners.has(target)) {
                 listeners.set(target, []);
@@ -149,12 +182,11 @@ function Runspace(scope, options) {
             }
         }
     });
-
     self.add(setTimeoutCtor, {
         functionType: 'ctor',
         deny: ['#ref']
     });
-    self.timers = self.add(timers, {
+    self.add(timers, {
         call: function (method, fn, args, target, undef) {
             var arr = timerCallbacks[method.substr(method.charAt(0) === 's' ? 3 : 5).toLowerCase()];
             if (method.charAt(0) === 's') {
@@ -185,16 +217,21 @@ function Runspace(scope, options) {
             }
         }
     });
-    self.context.setImmediate = self.timers.setImmediate;
-    self.context.setInterval = self.timers.setInterval;
-    self.context.setTimeout = self.timers.setTimeout;
-    self.context.clearImmediate = self.timers.clearImmediate;
-    self.context.clearInterval = self.timers.clearInterval;
-    self.context.clearTimeout = self.timers.clearTimeout;
-
-    self.context.process = self.add(process, {
+    self.add(process, {
         name: 'process',
-        deny: ['stdin', 'abort', 'binding', 'chdir', 'dlopen', 'exit', 'setgid', 'setegid', 'setuid', 'seteuid', 'setgroups', 'initgroups', 'kill', 'disconnect', 'mainModule'],
+        deny: PROCESS_DENY,
+        freeze: true,
+        get: function (prop) {
+            if (prop === 'stdin') {
+                return stdin.readable;
+            }
+            if (prop === 'stdout') {
+                return stdout.writable;
+            }
+            if (prop === 'stderr') {
+                return stderr.writable;
+            }
+        },
         call: function (method, fn, args, target, undef) {
             if (method === 'send') {
                 var message = JSON.parse(JSON.stringify(args[0]));
@@ -206,7 +243,7 @@ function Runspace(scope, options) {
             }
         }
     });
-    self.fs = self.add(fs, {
+    self.add(fs, {
         name: 'fs',
         call: function (method, fn, args) {
             if (fsArgCheck[method] & 1) {
@@ -228,17 +265,29 @@ function Runspace(scope, options) {
         }
     });
 
+    // setup global context in user-code space
+    self.context = vm.createContext(GLOBALS);
+    self.context.global = self.context;
+    self.context.process = self.getProxy(process);
+
+    var timerProxy = self.getProxy(timers);
+    self.context.setImmediate = timerProxy.setImmediate;
+    self.context.setInterval = timerProxy.setInterval;
+    self.context.setTimeout = timerProxy.setTimeout;
+    self.context.clearImmediate = timerProxy.clearImmediate;
+    self.context.clearInterval = timerProxy.clearInterval;
+    self.context.clearTimeout = timerProxy.clearTimeout;
+
     // prevent user-code accessing objects outside runspace.context
     // by accessing internal V8 CallSite objects
     vm.runInContext('Object.defineProperty(Error, \'prepareStackTrace\', { value: undefined })', self.context);
 
     function forwardExit() {
-        self.processEE.emit('exit');
+        processEE.emit('exit');
     }
     process.on('exit', forwardExit);
     self.once('terminate', function () {
         process.removeListener('exit', forwardExit);
-        self.processEE.emit('exit');
         timerCallbacks.immediate.forEach(clearImmediate);
         timerCallbacks.interval.forEach(clearInterval);
         timerCallbacks.timeout.forEach(clearTimeout);
@@ -252,6 +301,7 @@ function Runspace(scope, options) {
             clearArray(v);
         });
         listeners.clear();
+        processEE.emit('exit');
     });
 }
 util.inherits(Runspace, Proxy);
@@ -262,7 +312,7 @@ Runspace.prototype.isPathAllowed = function (path) {
 
 Runspace.prototype.send = function (message) {
     message = JSON.parse(JSON.stringify(message));
-    this.processEE.emit('message', message);
+    this.context.process.emit('message', message);
 };
 
 Runspace.prototype.compileScript = function (code, filename) {

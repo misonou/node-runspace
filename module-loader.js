@@ -58,11 +58,8 @@ function tryExtensions(p, exts) {
     }
 }
 
-function tryFile(filename, exts, requireExt) {
-    if (isDirectory(path.dirname(filename))) {
-        var extname = path.extname(filename);
-        return ((!requireExt || extname) && isFile(filename)) || (!extname && tryExtensions(filename, exts));
-    }
+function tryFile(filename, exts) {
+    return isFile(filename) || (!path.extname(filename) && tryExtensions(filename, exts));
 }
 
 function tryPackage(dirname, exts) {
@@ -72,7 +69,7 @@ function tryPackage(dirname, exts) {
             var manifest = JSON.parse(fs.readFileSync(jsonPath));
             if (typeof manifest.main === 'string') {
                 var filename = path.resolve(dirname, manifest.main);
-                return tryFile(filename, exts) || tryFile(path.resolve(filename, 'index'), exts, true);
+                return tryFile(filename, exts) || tryExtensions(path.join(filename, 'index'), exts);
             }
         } catch (ex) {
             ex.path = jsonPath;
@@ -83,7 +80,7 @@ function tryPackage(dirname, exts) {
 }
 
 function tryDirectory(dirname, exts) {
-    return tryPackage(dirname, exts) || tryFile(path.join(dirname, 'index'), exts, true);
+    return tryPackage(dirname, exts) || tryExtensions(path.join(dirname, 'index'), exts);
 }
 
 function requireAt(runspace, loader, dir, parent) {

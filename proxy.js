@@ -103,6 +103,31 @@ function createProxy(host, target, options, map) {
         return obj;
     }
 
+    function freezeObject(obj, map) {
+        if (obj && typeof obj === 'object') {
+            // objects that are already proxied or can be handled by existing proxies
+            // are handled by the proxy and will not be freezed
+            if (wrapObject(obj) === obj) {
+                var plainObjectOrArray = DONT_PROXY.slice(2).every(function (v) {
+                    return !(obj instanceof v);
+                });
+                if (plainObjectOrArray) {
+                    if (Array.isArray(obj)) {
+                        map.set(obj, Object.freeze(obj.map(function (v) {
+                            return freezeValue(v, map);
+                        })));
+                    } else {
+                        Object.preventExtensions(createProxy(host, obj, {
+                            freeze: true
+                        }, map));
+                    }
+                }
+            }
+            return host.getProxy(obj) || obj;
+        }
+        return obj;
+    }
+
     function createAssertion(prop, message) {
         if ((Array.isArray(options.deny) && options.deny.indexOf(prop) >= 0) ||
             (Array.isArray(options.allow) && options.allow.indexOf(prop) < 0)) {
@@ -136,7 +161,7 @@ function createProxy(host, target, options, map) {
     function createCtorFunction(ctor, name, map) {
         name = ctor.name || name || '';
         if (DONT_PROXY.indexOf(ctor) >= 0) {
-            throw new Error('Constructor \'' + name + '\' cannot be proxied');
+            throw new TypeError('Constructor \'' + name + '\' cannot be proxied');
         }
         var CtorProxy = createNamedFunction(name, function () {
             host.throwIfTerminated();
@@ -207,38 +232,114 @@ function createProxy(host, target, options, map) {
         return createFunction(name, fn, wrapObject, unwrapObject);
     }
 
-    function createGetter(name, obj) {
+    function createGetter(name, obj, map) {
         var prop = name.replace(reBeforeDot, '');
         var assert = createAssertion(name);
+        var freeze = options.freeze === true || (Array.isArray(options.freeze) && options.freeze.indexOf(name) >= 0);
         return function () {
             host.throwIfTerminated();
             assert();
+            var value = obj[prop];
             if (options.get) {
-                var value = options.get(name, obj, undef);
-                if (value !== undefined) {
-                    return wrapObject(undef.unwrap(value));
+                var nvalue = options.get(name, value, obj, undef);
+                if (nvalue !== undefined) {
+                    value = undef.unwrap(nvalue);
                 }
             }
-            return wrapObject(obj[prop]);
+            if (freeze) {
+                return freezeObject(value, map);
+            }
+            return wrapObject(value);
         };
     }
 
-    function createSetter(name, obj) {
+    function createSetter(name, obj, map) {
         var prop = name.replace(reBeforeDot, '');
         var assert = createAssertion(name);
+        var freeze = options.freeze === true || (Array.isArray(options.freeze) && options.freeze.indexOf(name) >= 0);
         return function (value) {
             host.throwIfTerminated();
             assert();
-            value = unwrapObject(value);
-            if (options.set) {
-                var nvalue = options.set(name, value, obj, undef);
-                if (nvalue !== undefined) {
-                    obj[prop] = undef.unwrap(nvalue);
-                    return;
+            if (!freeze) {
+                value = unwrapObject(value);
+                if (options.set) {
+                    var nvalue = options.set(name, value, obj, undef);
+                    if (nvalue !== undefined) {
+                        obj[prop] = undef.unwrap(nvalue);
+                        return;
+                    }
                 }
+                obj[prop] = value;
             }
-            obj[prop] = value;
         };
+    }
+
+    function defineProperty(proxy, target, prop, descriptor, map, ns) {
+        var nsprop = (ns || '') + prop;
+        if (prop.charAt(0).toLowerCase() !== prop.charAt(0) && typeof target[prop] === 'function') {
+            // assume function from a captialized property is a constructor
+            // but do not process the same constructor again
+            Object.defineProperty(proxy, prop, {
+                value: host.getProxy(target[prop]) || createCtorFunction(target[prop], prop),
+                writable: descriptor.writable,
+                enumerable: descriptor.enumerable
+            });
+        } else if (descriptor.get || descriptor.set) {
+            Object.defineProperty(proxy, prop, {
+                get: descriptor.get && createGetter(nsprop, target, map),
+                set: descriptor.set && createSetter(nsprop, target, map),
+                enumerable: descriptor.enumerable
+            });
+        } else if (descriptor.writable) {
+            var getter = createGetter(nsprop, target, map);
+            var setter = createSetter(nsprop, target, map);
+            Object.defineProperty(proxy, prop, {
+                get: function () {
+                    var value = target[prop];
+                    if (typeof value === 'function') {
+                        if (!map.has(value)) {
+                            map.set(value, createInFunction(nsprop, value));
+                        }
+                        return map.get(value);
+                    }
+                    return getter();
+                },
+                set: function (value) {
+                    if (this !== proxy) {
+                        // set value as an own property which has already been
+                        // defined on its prototype chain
+                        if (this !== unwrapObject(this)) {
+                            var map = host.isWeaklyProxied(unwrapObject(this)) ? host._tempMap : host._permMap;
+                            defineProperty(this, unwrapObject(this), prop, descriptor, map, ns);
+                            this[prop] = value;
+                        } else {
+                            Object.defineProperty(this, prop, {
+                                value: value,
+                                writable: true,
+                                enumerable: descriptor.enumerable,
+                                configurable: true
+                            });
+                        }
+                        return;
+                    }
+                    if (typeof target[prop] === 'function') {
+                        throwEAcces(this, prop, 'Writing to property %s is blocked');
+                    }
+                    setter(value);
+                },
+                enumerable: descriptor.enumerable
+            });
+        } else if (typeof target[prop] === 'function') {
+            Object.defineProperty(proxy, prop, {
+                value: createInFunction(nsprop, target[prop]),
+                enumerable: descriptor.enumerable
+            });
+        } else {
+            Object.defineProperty(proxy, prop, {
+                get: createGetter(nsprop, target, map),
+                enumerable: descriptor.enumerable
+            });
+        }
     }
 
     function defineProperties(proxy, target, map, ns) {
@@ -256,71 +357,8 @@ function createProxy(host, target, options, map) {
                 (Object.getOwnPropertyDescriptor(proxy, prop) || {}).configurable === false) {
                 return;
             }
-
             var descriptor = Object.getOwnPropertyDescriptor(target, prop);
-            var nsprop = (ns || '') + prop;
-
-            if (prop.charAt(0).toLowerCase() !== prop.charAt(0) && typeof target[prop] === 'function') {
-                // assume function from a captialized property is a constructor
-                // but do not process the same constructor again
-                Object.defineProperty(proxy, prop, {
-                    value: host.getProxy(target[prop]) || createCtorFunction(target[prop], prop),
-                    writable: true,
-                    configurable: descriptor.configurable,
-                    enumerable: descriptor.enumerable
-                });
-            } else if (descriptor.get || descriptor.set) {
-                Object.defineProperty(proxy, prop, {
-                    get: descriptor.get && createGetter(nsprop, target),
-                    set: descriptor.set && createSetter(nsprop, target),
-                    configurable: descriptor.configurable,
-                    enumerable: descriptor.enumerable
-                });
-            } else if (descriptor.writable) {
-                var getter = createGetter(nsprop, target);
-                var setter = createSetter(nsprop, target);
-                Object.defineProperty(proxy, prop, {
-                    get: function () {
-                        var value = target[prop];
-                        if (typeof value === 'function') {
-                            if (!map.has(value)) {
-                                map.set(value, createInFunction(nsprop, value));
-                            }
-                            return map.get(value);
-                        }
-                        return getter();
-                    },
-                    set: function (value) {
-                        if (this !== proxy && !hasOwnProperty(this, prop)) {
-                            Object.defineProperty(this, prop, {
-                                value: value,
-                                writable: true,
-                                configurable: descriptor.configurable,
-                                enumerable: descriptor.enumerable
-                            });
-                            return;
-                        }
-                        if (typeof target[prop] === 'function') {
-                            throwEAcces(this, prop, 'Writing to property %s is blocked');
-                        }
-                        setter(value);
-                    },
-                    configurable: descriptor.configurable,
-                    enumerable: descriptor.enumerable
-                });
-            } else if (typeof target[prop] === 'function') {
-                Object.defineProperty(proxy, prop, {
-                    value: createInFunction(nsprop, target[prop]),
-                    configurable: descriptor.configurable,
-                    enumerable: descriptor.enumerable
-                });
-            } else {
-                Object.defineProperty(proxy, prop, {
-                    get: createGetter(nsprop, target),
-                    configurable: descriptor.configurable,
-                    enumerable: descriptor.enumerable
-                });
-            }
+            defineProperty(proxy, target, prop, descriptor, map, ns);
         });
     }
 
@@ -333,7 +371,10 @@ function createProxy(host, target, options, map) {
         }
         return createInFunction(options.name, target);
     }
-    return createObject(target, options.name, map);
+    if (typeof target === 'object') {
+        return createObject(target, options.name, map);
+    }
+    throw new TypeError('Primitive value cannot be proxied');
 }
 
 function Proxy() {

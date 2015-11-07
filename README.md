@@ -13,7 +13,10 @@ Creates a sandbox for running untrusted code.
 Creates a sandbox for running untrusted code that is rooted at the given path.
 Files and modules outside the given path are normally denied for access.
 
-See [Sandbox](#sandbox) section for more details.
+Additional controls to native APIs and loaded modules can also be done
+by creating object proxies.
+
+See [Proxy](#proxy) and [Sandbox](#sandbox) section for more details.
 
 ```javascript
 var runspace = new Runspace('./sandbox');
@@ -58,13 +61,16 @@ runspace.compileScript('console.log()', '/outside-sandbox/example.js');
 
 #### Passing additional globals
 
-Another than default available globals (See [Global](#global)),
+Other than natively available globals (See [Global](#global)),
 additional global variables can be passed to the compiled script.
 
 ```javascript
 var script = runspace.compileScript('return number + 1;', './sandbox/add.js');
 script.run({ number: 1 }); // 2
 ```
+
+**Note:** They are actually not real globals but rather local to
+the function body which is composed from the loaded script.
 
 ### runspace.terminate()
 
@@ -111,7 +117,7 @@ var returnedInstA = script.run({
     ClassX: ClassX,
     instA: instA,
     instB: new ClassB(),
-    instC: new ClassX(),
+    instX: new ClassX(),
     objNotAdded: {},
     func: function (argInstA) {
         // arguments are un-proxied
@@ -128,7 +134,7 @@ ClassA, ClassB, instA, instB, objAdded;
 ClassA.prototype, Object.getPrototypeOf(instB), instB.__proto__;
 
 // NOT proxied
-ClassX, instC, objNotAdded;
+ClassX, instX, objNotAdded;
 
 // proxied instA is un-proxied when passed to callbacks
 // and returned instA is re-proxied
@@ -213,9 +219,13 @@ Below is an exhausive list of options. All options are **optional**.
     // see notes below
     deny: [],
 
+    // list of properties which their values should be freezed
+    // set to true if values of all properties should be freezed
+    freeze: [],
+
     // called when getting property on a proxy
     // see 'Interceptors'
-    get: function (name, target, undef) { ... },
+    get: function (name, value, target, undef) { ... },
 
     // called when setting property on a proxy
     // see 'Interceptors'
@@ -296,10 +306,10 @@ var target = {
     five: 5
 };
 runspace.proxy(target, {
-    get: function (name, target, undef) {
+    get: function (name, value, target, undef) {
         switch (name) {
         case 'one':
-            return target[name] + '';
+            return value + '';
         case 'two':
             return undef;
         case 'three':
@@ -321,7 +331,17 @@ target.four;  // undefined (undef.wrap wrapped undefined)
 target.five;  // 5 (proceed to original property/getter)
 ```
 
-## Other methods
+## Other properties and methods
+
+### runspace.context
+
+The contextified VM sandbox which untrusted code runs in. Additional globals
+can be declared on this object.
+
+### runspace.stdin, runspace.stdour, runspace.stderr
+
+Readable and writable streams piped from/to `process.stdin`, `process.stdout` and `process.stderr`
+that are visible inside the sandbox.
 
 ### runspace.send(message)
 
@@ -348,22 +368,31 @@ Typed arrays and `Buffer` are shared and **NOT** proxied.
 ### EventEmitter
 
 Even if the `EventEmitter` object is shared across sandboxes, listeners are scoped
-within sandboxes.
+within each sandbox. That is, only listeners attached from the same sandbox
+can be listed.
 
 #### EventEmitter.listeners([event])
 
-Returns only listeners that are bound by the calling sandbox.
+Returns only listeners that are attached by the calling sandbox.
 
 #### EventEmitter.removeAllListeners([event])
 
-Removes only listeners that are bound by the calling sanbox.
+Removes only listeners that are attached by the calling sanbox.
 
 ### process
 
 The following properties and methods are blocked from access:
 
-`stdin`, `abort`, `binding`, `chdir`, `dlopen`, `exit`, `setgid`, `setegid`, `setuid`, `seteuid`,
+`abort`, `binding`, `chdir`, `dlopen`, `exit`, `setgid`, `setegid`, `setuid`, `seteuid`,
 `setgroups`, `initgroups`, `kill`, `disconnect`, `mainModule`.
+
+#### process.stdin, process.stdout, process.stderr
+
+The three standard IO streams are piped from/to the hosting `runspace.stdin`,
+`runspace.stdout` and `runspace.stderr` writables and readables.
+
+If there are no `data` event listeners attached in the readable end of those pipes,
+any data written to those streams are discarded.
 
 #### process.cwd()
 
