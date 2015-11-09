@@ -1,6 +1,6 @@
 # Runspace
 
-Creates a sandbox for running untrusted code.
+Sandbox for running untrusted code with full-fledged module loading mechanism.
 
 ## Installation
 
@@ -10,75 +10,111 @@ Creates a sandbox for running untrusted code.
 
 ### Runspace(path, [options])
 
-Creates a sandbox for running untrusted code that is rooted at the given path.
-Files and modules outside the given path are normally denied for access.
+Creates a sandbox rooted at the given path.
 
-Additional controls to native APIs and loaded modules can also be done
-by creating object proxies.
+Files and modules outside the given path are normally denied for access.
+Additional controls to native and user modules can also be defined
+by creating proxies.
 
 See [Proxy](#proxy) and [Sandbox](#sandbox) section for more details.
 
 ```javascript
+var Runspace = require('runspace');
 var runspace = new Runspace('./sandbox');
-var script = runspace.compileScript('return number + 1;', './sandbox/add.js');
-script.run({ number: 1 }); // 2
+
+// all legitimate Node.js codes can be run smoothly
+// inside the created sandbox without acknowledging it
+runspace.run('                                                \
+    var fs = require("fs");                                   \
+    var util = require("util");                               \
+    fs.readFile("./my.txt", function (err, data) {            \
+        process.stdout.write(util.format(data, +new Date())); \
+    });                                                       \
+');
 ```
 
 #### Options
 
-Below is an exhausive list of options, with the default value shown.
+Below is an exhaustive list of options, with the default value shown.
 
 ```javascript
 {
-    // list of whitelist paths which scripts
-    // inside sandbox can load modules from
+    // list of whitelist paths where modules inside
+    // can be loaded by untrusted codes
     loadPaths: []
 }
 ```
 
-### runspace.compileScript(code, filename)
+### runspace.run(code, [filename], [globals])
 
-The second argument `filename` is required but need not to be an existed one.
-It will be the working path for resolving module locations.
+Runs the code in contextified sandbox.
+If `filename` is given, it determines the working path for resolving module locations.
 
 ```javascript
 var runspace = new Runspace('/parent/sandbox');
-var script = runspace.compileScript('require("dependency")', '/parent/sandbox/b/hello-world.js');
 
 // look for:
-// /parent/sandbox/b/dependency
-// /parent/sandbox/b/dependency.{js,json,node}
-// /parent/sandbox/b/dependency/index.{js,json,node}
-// /parent/sandbox/b/node_modules/dependency
+// /parent/sandbox/subdir/dependency
+// /parent/sandbox/subdir/dependency.{js,json,node}
+// /parent/sandbox/subdir/dependency/index.{js,json,node}
+// /parent/sandbox/subdir/node_modules/dependency
 // /parent/sandbox/node_modules/dependency
 // but NOT:
-// /parent/node_modules/dependency, /node_modules/dependency
-script.run();
+// /parent/node_modules/dependency
+// /node_modules/dependency
+// /other_global_paths/dependency
+runspace.run('require("dependency")', '/parent/sandbox/subdir/hello-world.js');
 
-// throws exception
-runspace.compileScript('console.log()', '/outside-sandbox/example.js');
+// throws exception for invalid path
+runspace.run('', '/outside-sandbox/example.js');
+```
+
+This method is identical to calling `runspace.compile()` then `run()`,
+except that this method compiles code each time called.
+
+```javascript
+// the following two lines gives identical result
+runspace.run(code, filename, globals);
+runspace.compile(code, filename).run(globals);
 ```
 
 #### Passing additional globals
 
-Other than natively available globals (See [Global](#global)),
+Other than built-in JavaScript and Node.js objects (see [Global](#global)),
 additional global variables can be passed to the compiled script.
 
 ```javascript
-var script = runspace.compileScript('return number + 1;', './sandbox/add.js');
-script.run({ number: 1 }); // 2
+runspace.run('console.log(number)', { number: 1 }); // prints '1'
 ```
 
 **Note:** They are actually not real globals but rather local to
-the function body which is composed from the loaded script.
+the function composed by the supplied code.
+
+### runspace.compile(code, [filename])
+
+Compiles the code in contextified sandbox.
+If `filename` is given, it determines the working path for resolving module locations.
+
+```javascript
+var script = runspace.compile('console.log(number)');
+script.run({ number: 1 }); // prints '1'
+```
 
 ### runspace.terminate()
 
 A runspace can be terminated by calling `terminate()`.
 
+All proxies, event listeners and timeouts are cleared.
+This allows GC to free resources taken up by the sandbox.
+Subsequent async callbacks and attempts to access proxies will throw exception.
+
 ### Event: message
 
 Triggered when `process.send()` is called inside sandbox.
+
+### Event: error
+
+Triggered when an exception is thrown and uncaught inside sandbox.
 
 ### Event: terminate
 
@@ -101,16 +137,17 @@ Functions and callbacks are handled such that arguments and return values are
 translated from objects to their proxy counterparts and vice versa.
 
 ```javascript
+/* host */
 function ClassA() {}
 function ClassB() {}
 function ClassX() {}
 var objAdded = {};
+var instA = new ClassA();
 
 runspace.add(new ClassA());
 runspace.add(ClassB);
 runspace.add(objAdded);
 
-var instA = new ClassA();
 var returnedInstA = script.run({
     ClassA: ClassA,
     ClassB: ClassB,
@@ -120,28 +157,30 @@ var returnedInstA = script.run({
     instX: new ClassX(),
     objNotAdded: {},
     func: function (argInstA) {
-        // arguments are un-proxied
-        argInstA === instA; // true
+        // arguments from sandbox are un-proxied
+        argInstA === instA;
+        // return value will be re-proxied
         return instA;
     }
 });
-// returned value is un-proxied
-returnedInstA === instA; // true
-
-// sandbox
-// proxied
+// returned value from sandbox is un-proxied
+returnedInstA === instA;
+```
+```javascript
+/* sandbox */
+// the following objects from host are proxied
 ClassA, ClassB, instA, instB, objAdded;
-ClassA.prototype, Object.getPrototypeOf(instB), instB.__proto__;
+ClassA.prototype, Object.getPrototypeOf(instB);
 
-// NOT proxied
+// the following objects from host are NOT proxied
 ClassX, instX, objNotAdded;
 
-// proxied instA is un-proxied when passed to callbacks
+// proxied instA is un-proxied when passed to func()
 // and returned instA is re-proxied
 var returnedInstA = func(instA);
 returnedInstA === instA;
 
-// proxied instA is un-proxied when returned
+// proxied instA will be un-proxied when returned to host
 return instA;
 ```
 
@@ -160,7 +199,8 @@ Objects are proxied in two flavors:
 -   **Strongly-referenced** proxies are for global and shared objects.
     The references being strong allows `Runspace` to clear resources when terminating.
 
-The target's prototypes are **implicitly** proxied recursively, i.e. all prototype objects and constructors up
+The target's prototypes are **implicitly** proxied recursively,
+i.e. all prototype objects and constructors up
 the prototype chain have also their proxy counterparts.
 
 **Differences on add/proxy/weakProxy: **
@@ -187,12 +227,11 @@ the prototype chain have also their proxy counterparts.
 </table>
 
 > **Important:** Calling the proxy generating methods for the same target repeatedly
-  returns the same already-generated proxy instead of a new one; and
-  the flavor of the proxy (strong-/weak-referenced) also remains unchanged.
+  returns the same proxy with its flavor (strong-/weak-referenced) unchanged.
 
 #### Options
 
-Below is an exhausive list of options. All options are **optional**.
+Below is an exhaustive list of options. All options are **optional**.
 
 ```javascript
 {
@@ -204,7 +243,7 @@ Below is an exhausive list of options. All options are **optional**.
     // accepted values: 'in', 'out', 'ctor'
     // specify whether the function:
     // in: accepts arguments from and returns value to sandbox
-    // out: accepts arguments from and returns value to outside sandbox
+    // out: accepts arguments from and returns value to host
     // ctor: is a constructor (prototype chain is also proxied)
     // default -
     //    if function name starts with an Uppercased letter: 'ctor'
@@ -219,8 +258,8 @@ Below is an exhausive list of options. All options are **optional**.
     // see notes below
     deny: [],
 
-    // list of properties which their values should be freezed
-    // set to true if values of all properties should be freezed
+    // list of properties which their values should be freezed; or
+    // true if values of all properties should be freezed
     freeze: [],
 
     // called when getting property on a proxy
@@ -265,11 +304,11 @@ Referencing argument names of interceptor options shown in above section:
 
 `target`: target object proxied
 
-`undef`: when returned from interceptors, tell the proxy `undefined` as the return value instead of
+`undef`: when returned from interceptors, tell the proxy to return `undefined` as the return value instead of
 proceeding. Arbitrary return value can be wrapped by `undef.wrap()`.
 
 ```javascript
-undef.wrap(3);                   //3
+undef.wrap(3);                   // 3
 undef.wrap(null);                // null
 undef.wrap(undefined) === undef; // true
 ```
@@ -277,6 +316,7 @@ undef.wrap(undefined) === undef; // true
 #### Example: Modifying arguments
 
 ```javascript
+/* host */
 var target = {
     add: function (a, b) {
         return a + b;
@@ -289,8 +329,9 @@ runspace.proxy(target, {
         }
     }
 });
-
-// sandbox
+```
+```javascript
+/* sandbox */
 target.add(1, 2); // '12'
 target.add(null, 2); // 'null2'
 ```
@@ -298,6 +339,7 @@ target.add(null, 2); // 'null2'
 #### Example: Modifying return value
 
 ```javascript
+/* host */
 var target = {
     one: 1,
     two: 2,
@@ -322,8 +364,9 @@ runspace.proxy(target, {
         /* return undefined */;
     }
 });
-
-// sandbox
+```
+```javascript
+/* sandbox */
 target.one;   // '1'
 target.two;   // undefined (undefined as return value)
 target.three; // 3 (undef.wrap returned as-is)
@@ -335,35 +378,29 @@ target.five;  // 5 (proceed to original property/getter)
 
 ### runspace.context
 
-The contextified VM sandbox which untrusted code runs in. Additional globals
+The contextified sandbox which untrusted code runs in. Additional globals
 can be declared on this object.
 
-### runspace.stdin, runspace.stdour, runspace.stderr
+### runspace.stdin, runspace.stdout, runspace.stderr
 
 Readable and writable streams piped from/to `process.stdin`, `process.stdout` and `process.stderr`
-that are visible inside the sandbox.
+that are available inside sandbox.
 
 ### runspace.send(message)
 
 Sandboxed code receives the message by `process.on('message')`.
-The message can be pritimtive values or object literals.
-
-If object is supplied, the object is sanitized and only primitive valued
-properties are sent to the sandbox.
+The message can be primitive values or JSON objects.
 
 ## Sandbox
 
-The following section describes behaviors of globals and built-in modules
-inside `Runspace`-created sandbox.
+The following section describes behaviors of global objects and built-in modules inside sandbox.
 
 ### Global
 
-The `global` object is a contextified sandbox.
+The global scope and the `global` object is a contextified sandbox.
 
-Other than default JavaScript globals, globals that are available by Node.js
-are also available inside sandbox.
-
-Typed arrays and `Buffer` are shared and **NOT** proxied.
+Other than standard built-in global objects, objects that are native from Node.js
+are also available inside sandbox. Native objects, typed arrays and buffers are **NOT** proxied.
 
 ### EventEmitter
 
@@ -371,13 +408,29 @@ Even if the `EventEmitter` object is shared across sandboxes, listeners are scop
 within each sandbox. That is, only listeners attached from the same sandbox
 can be listed.
 
-#### EventEmitter.listeners([event])
+```javascript
+var ee = new EventEmitter();
+var rs1 = new Runspace('./');
+var rs2 = new Runspace('./');
+var script1 = rs1.compile('ee.on("event", function () {}); console.log(ee.listenerCount("event"))');
+var script2 = rs2.compile('ee.on("event", function () {}); console.log(ee.listenerCount("event"))');
 
-Returns only listeners that are attached by the calling sandbox.
+script1.run({ ee: ee }); // prints 1
+script2.run({ ee: ee }); // prints 1
+script1.run({ ee: ee }); // prints 2
+```
 
-#### EventEmitter.removeAllListeners([event])
+#### EventEmitter.listeners(eventType)
 
-Removes only listeners that are attached by the calling sanbox.
+Returns listeners attached by the calling sandbox.
+
+#### EventEmitter.listenerCount(eventType)
+
+Returns the number of listeners attached by the calling sandbox.
+
+#### EventEmitter.removeAllListeners([eventType])
+
+Removes listeners attached by the calling sandbox.
 
 ### process
 
@@ -421,6 +474,10 @@ Calling `ref()` throws exception.
 
 All functions that mention a path other than file descriptor throws exception when
 supplied with paths outside the sandbox's scope.
+
+### path
+
+`path.resolve()` resolves paths from the sandbox root rather than actual working directory.
 
 ### require
 

@@ -2,6 +2,7 @@
 
 'use strict';
 
+var domain = require('domain');
 var EventEmitter = require('events').EventEmitter;
 var fs = require('fs');
 var path = require('path');
@@ -137,17 +138,18 @@ function Runspace(scope, options) {
             case 'EventEmitter#on':
             case 'EventEmitter#addListener':
             case 'EventEmitter#once':
-                var callbackProxy = function () {
-                    if (method.substr(-4) === 'once') {
+                var callbackProxy = callback;
+                if (method.substr(-4) === 'once') {
+                    callbackProxy = function () {
                         for (var i = 0, length = arr.length; i < length; i++) {
                             if (arr[i].callback === callback) {
                                 arr.splice(i, 1);
                                 break;
                             }
                         }
-                    }
-                    callback.apply(this, arguments);
-                };
+                        callback.apply(this, arguments);
+                    };
+                }
                 arr.push({
                     type: eventType,
                     callback: callback,
@@ -182,6 +184,7 @@ function Runspace(scope, options) {
             }
         }
     });
+    self.add(stream);
     self.add(setTimeoutCtor, {
         functionType: 'ctor',
         deny: ['#ref']
@@ -278,6 +281,12 @@ function Runspace(scope, options) {
     self.context.clearInterval = timerProxy.clearInterval;
     self.context.clearTimeout = timerProxy.clearTimeout;
 
+    self._domain = domain.create();
+    self._domain.on('error', function (err) {
+        self._domain.exit();
+        self.emit('error', err);
+    });
+
     // prevent user-code accessing objects outside runspace.context
     // by accessing internal V8 CallSite objects
     vm.runInContext('Object.defineProperty(Error, \'prepareStackTrace\', { value: undefined })', self.context);
@@ -309,15 +318,20 @@ util.inherits(Runspace, Proxy);
 Runspace.prototype.isPathAllowed = function (path) {
     return isContained(this.scope, path);
 };
-
 Runspace.prototype.send = function (message) {
     message = JSON.parse(JSON.stringify(message));
     this.context.process.emit('message', message);
 };
-
-Runspace.prototype.compileScript = function (code, filename) {
+Runspace.prototype.run = function (code, filename, localVars) {
+    if (typeof filename === 'object') {
+        localVars = filename;
+        filename = undefined;
+    }
+    return this.compile(code, filename).run(localVars);
+};
+Runspace.prototype.compile = function (code, filename) {
     var self = this;
-    var dirname = path.dirname(filename);
+    var dirname = filename ? path.dirname(filename) : self.scope;
     var require = self.moduleLoader.requireAt(dirname);
     var dummy = new vm.Script(code);
     var argNames = [];
@@ -325,7 +339,7 @@ Runspace.prototype.compileScript = function (code, filename) {
 
     return {
         run: function (localVars) {
-            Object.keys(localVars).forEach(function (v) {
+            Object.keys(localVars || {}).forEach(function (v) {
                 if (argNames.indexOf(v) < 0) {
                     argNames.push(v);
                     fn = null;
@@ -340,7 +354,18 @@ Runspace.prototype.compileScript = function (code, filename) {
             var argList = argNames.map(function (v) {
                 return localVars[v];
             });
-            return fn.apply(self.context, [require, filename, dirname].concat(argList));
+            var returnValue, err;
+            self._domain.run(function () {
+                try {
+                    returnValue = fn.apply(self.context, [require, filename, dirname].concat(argList));
+                } catch (ex) {
+                    err = ex;
+                }
+            });
+            if (err) {
+                throw err;
+            }
+            return returnValue;
         }
     };
 };

@@ -4,6 +4,7 @@
 
 var EventEmitter = require('events').EventEmitter;
 var util = require('util');
+var vm = require('vm');
 var Map = require('./map');
 var WeakMap = require('./weak-map');
 
@@ -11,20 +12,12 @@ var reBeforeDot = /^.*(\.|#)/;
 var namedFnGen = {};
 var internalAccess;
 
-var DONT_PROXY = [
-    Object,
-    Array,
-    Buffer,
-    Int8Array,
-    Int16Array,
-    Int32Array,
-    Uint8Array,
-    Uint8ClampedArray,
-    Uint16Array,
-    Uint32Array,
-    Float64Array,
-    ArrayBuffer
-];
+var DONT_PROXY = vm.runInNewContext('Object.getOwnPropertyNames(this)').filter(function (v) {
+    return v.charAt(0).toLowerCase() !== v.charAt(0) && typeof global[v] === 'function' && v !== 'Object';
+}).map(function (v) {
+    return global[v];
+});
+DONT_PROXY.push(Buffer, ArrayBuffer, Int8Array, Int16Array, Int32Array, Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array, Float64Array);
 
 var undef = Object.freeze({
     wrap: function (v) {
@@ -49,6 +42,15 @@ function hasOwnProperty(obj, prop) {
     // obj.hasOwnProperty(prop) will break.
     // See: https://github.com/joyent/node/issues/1707
     return Object.prototype.hasOwnProperty.call(obj, prop);
+}
+
+function dontProxy(obj) {
+    if (typeof obj === 'function') {
+        return obj === Object || DONT_PROXY.indexOf(obj) >= 0;
+    }
+    return DONT_PROXY.some(function (v) {
+        return obj instanceof v;
+    });
 }
 
 function throwEAcces(target, prop, message) {
@@ -86,7 +88,14 @@ function createProxy(host, target, options, map) {
 
     function wrapObject(obj) {
         if (obj && (typeof obj === 'object' || typeof obj === 'function')) {
-            return host.getProxy(obj) || (host.getProxy(obj.constructor) && new(host.getProxy(obj.constructor))(obj)) || obj;
+            var proxy = host.getProxy(obj);
+            if (proxy) {
+                return proxy;
+            }
+            var CtorProxy = host.getProxy(obj.constructor);
+            if (CtorProxy) {
+                return new CtorProxy(obj);
+            }
         }
         return obj;
     }
@@ -108,19 +117,14 @@ function createProxy(host, target, options, map) {
             // objects that are already proxied or can be handled by existing proxies
             // are handled by the proxy and will not be freezed
             if (wrapObject(obj) === obj) {
-                var plainObjectOrArray = DONT_PROXY.slice(2).every(function (v) {
-                    return !(obj instanceof v);
-                });
-                if (plainObjectOrArray) {
-                    if (Array.isArray(obj)) {
-                        map.set(obj, Object.freeze(obj.map(function (v) {
-                            return freezeValue(v, map);
-                        })));
-                    } else {
-                        Object.preventExtensions(createProxy(host, obj, {
-                            freeze: true
-                        }, map));
-                    }
+                if (Array.isArray(obj)) {
+                    map.set(obj, Object.freeze(obj.map(function (v) {
+                        return freezeObject(v, map);
+                    })));
+                } else if (!dontProxy(obj)) {
+                    Object.preventExtensions(createProxy(host, obj, {
+                        freeze: true
+                    }, map));
                 }
             }
             return host.getProxy(obj) || obj;
@@ -140,7 +144,7 @@ function createProxy(host, target, options, map) {
 
     function createObject(obj, name, map, ns) {
         var proto = Object.getPrototypeOf(obj);
-        if (proto && DONT_PROXY.indexOf(proto.constructor) < 0) {
+        if (proto && !dontProxy(proto.constructor)) {
             var CtorProxy = host.getProxy(proto.constructor) || createCtorFunction(proto.constructor);
             if (proto.constructor.prototype !== proto) {
                 // this prototype object is not new'd and assigned to the constructor
@@ -160,7 +164,7 @@ function createProxy(host, target, options, map) {
 
     function createCtorFunction(ctor, name, map) {
         name = ctor.name || name || '';
-        if (DONT_PROXY.indexOf(ctor) >= 0) {
+        if (dontProxy(ctor)) {
             throw new TypeError('Constructor \'' + name + '\' cannot be proxied');
         }
         var CtorProxy = createNamedFunction(name, function () {
@@ -187,11 +191,9 @@ function createProxy(host, target, options, map) {
             }
             defineProperties(this, target, map, name + '#');
         });
-        defineProperties(CtorProxy, ctor, map || host._permMap, name + '.');
-
-        // setting up prototype of the constructor
         CtorProxy.prototype = createObject(ctor.prototype, name, map || host._permMap, name + '#');
         defineConstructor(CtorProxy.prototype, CtorProxy);
+        defineProperties(CtorProxy, ctor, map || host._permMap, name + '.');
         return CtorProxy;
     }
 
@@ -207,6 +209,7 @@ function createProxy(host, target, options, map) {
                 v = argsIn(v);
                 if (typeof v === 'function') {
                     return function () {
+                        host.throwIfTerminated();
                         var context = argsOut(this);
                         var args = slice.apply(null, arguments).map(argsOut);
                         return argsIn(v.apply(context, args));
@@ -358,6 +361,16 @@ function createProxy(host, target, options, map) {
                 return;
             }
             var descriptor = Object.getOwnPropertyDescriptor(target, prop);
+            if (!descriptor) {
+                // WTF the descriptor can be undefined!
+                // yes we encountered in process.env on Node.js 0.10 win32
+                descriptor = {
+                    value: target[prop],
+                    writable: true,
+                    enumerable: true,
+                    configurable: true
+                };
+            }
             defineProperty(proxy, target, prop, descriptor, map, ns);
         });
     }
@@ -372,6 +385,9 @@ function createProxy(host, target, options, map) {
         return createInFunction(options.name, target);
     }
     if (typeof target === 'object') {
+        if (dontProxy(target)) {
+            throw new TypeError('Object of \'' + target.constructor.name + '\' cannot be proxied');
+        }
         return createObject(target, options.name, map);
     }
     throw new TypeError('Primitive value cannot be proxied');
@@ -387,29 +403,23 @@ util.inherits(Proxy, EventEmitter);
 Proxy.prototype.proxy = function (obj, options) {
     return this.getProxy(obj) || createProxy(this, obj, options);
 };
-
 Proxy.prototype.weakProxy = function (obj, options) {
     return this.getProxy(obj) || createProxy(this, obj, options, this._tempMap);
 };
-
 Proxy.prototype.add = function (obj, options) {
     return this.getProxy(obj) || createProxy(this, obj, options, this._permMap);
 };
-
 Proxy.prototype.isWeaklyProxied = function (obj) {
     return this._tempMap.has(obj);
 };
-
 Proxy.prototype.getProxy = function (obj) {
     return this._permMap.get(obj) || this._tempMap.get(obj);
 };
-
 Proxy.prototype.throwIfTerminated = function () {
     if (this.terminated) {
         throw new Error('proxy terminated');
     }
 };
-
 Proxy.prototype.terminate = function () {
     Object.defineProperty(this, 'terminated', {
         value: true
