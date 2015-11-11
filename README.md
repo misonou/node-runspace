@@ -475,9 +475,31 @@ Calling `ref()` throws exception.
 All functions that mention a path other than file descriptor throws exception when
 supplied with paths outside the sandbox's scope.
 
+#### fs.watch(path, [option], [callback])
+
+File watchers created by `fs.watch()` are closed when the parent `Runspace` is terminated.
+Persistent file watchers are disallowed.
+
+#### fs.watchFile(path)
+
+Listeners attached to `fs.watchFile()` are unwatched when the parent `Runspace` is terminated.
+
+#### fs.unwatchFile(path, [listener])
+
+Only listeners attached by the calling sandbox are removed if no listeners is supplied.
+
 ### path
 
 `path.resolve()` resolves paths from the sandbox root rather than actual working directory.
+
+### dgram, net, tls, http, https
+
+Sockets and servers created by these modules are `unref`'d and cannot be `ref`'d,
+and are closed when the parent `Runspace` is terminated.
+
+### child_process, cluster, repl
+
+These built-in modules are disallowed. An `EACCES` error is thrown when requiring these modules.
 
 ### require
 

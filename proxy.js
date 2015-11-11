@@ -9,9 +9,11 @@ var Map = require('./map');
 var WeakMap = require('./weak-map');
 
 var reBeforeDot = /^.*(\.|#)/;
-var namedFnGen = {};
+var noop = function () {};
+var namedFnGen = Object.create(null);
 var internalAccess;
 
+var KEYWORDS = 'break case class catch const continue debugger default delete do else export extends false finally for function if import in instanceof let new null return super switch this throw true try typeof undefined var void while with yield'.split(' ');
 var DONT_PROXY = vm.runInNewContext('Object.getOwnPropertyNames(this)').filter(function (v) {
     return v.charAt(0).toLowerCase() !== v.charAt(0) && typeof global[v] === 'function' && v !== 'Object';
 }).map(function (v) {
@@ -53,9 +55,44 @@ function dontProxy(obj) {
     });
 }
 
+function exposeGlobals(context) {
+    var natives = vm.runInContext('var o = Object.create(null), self = this; Object.getOwnPropertyNames(self).forEach(function (i) { o[i] = self[i] }), o', context);
+    for (var i in natives) {
+        context[i] = natives[i];
+    }
+}
+
+function translateNativeObject(obj, src, dst) {
+    if (!src.isNaN) {
+        exposeGlobals(src);
+    }
+    if (!dst.isNaN) {
+        exposeGlobals(dst);
+    }
+    if (obj instanceof src.Date) {
+        return new dst.Date(+obj);
+    }
+    if (obj instanceof src.Error) {
+        var err = (dst[obj.constructor.name] || dst.Error)();
+        var keys = Object.getOwnPropertyNames(obj);
+        for (var i = 0, length = keys.length; i < length; i++) {
+            err[keys[i]] = obj[keys[i]];
+        }
+        return err;
+    }
+    if (obj instanceof src.RegExp) {
+        return new dst.RegExp(obj.source, (obj.global ? 'g' : '') + (obj.ignoreCase ? 'i' : '') + (obj.multiline ? 'm' : ''));
+    }
+    if (typeof obj === 'function') {
+        if (src[obj.name] && dst[obj.name]) {
+            return dst[obj.name];
+        }
+    }
+}
+
 function throwEAcces(target, prop, message) {
     var name = ((target !== null && target !== undefined && target.constructor.name) || '').replace(/(.)$/, '$1.') + prop;
-    var err = new Error(util.format(message || 'Access to property %s is blocked', name));
+    var err = new Error(util.format(message, name));
     err.code = 'EACCES';
     throw err;
 }
@@ -68,19 +105,30 @@ function defineConstructor(obj, constructor) {
     });
 }
 
-function createNamedFunction(name, fn) {
+function createNamedFunction(name, fn, errFn) {
     /* jshint -W054 */
-    name = name || '';
-    if (!namedFnGen[name]) {
-        namedFnGen[name] = new Function('fn', 'return function ' + (name || '') + '() { return fn.apply(this, arguments); }');
+    name = String(name || '').replace(/([^a-zA-Z0-9_$])+/g, '_');
+    if (KEYWORDS.indexOf(name) >= 0) {
+        name = '__' + name;
     }
-    return namedFnGen[name](fn || function () {});
+    if (!namedFnGen[name]) {
+        namedFnGen[name] = new Function('fn, errFn', 'return function ' + name + '() { try { return fn.apply(this, arguments); } catch (ex) { throw errFn(ex) || ex; } }');
+    }
+    return namedFnGen[name](fn || noop, errFn || noop);
 }
 
 function createNamedObject(name, prototype) {
     var obj = Object.create(prototype || Object.prototype);
     defineConstructor(obj, createNamedFunction(name));
     return obj;
+}
+
+function createCtorApply(ctor) {
+    return function () {
+        var obj = Object.create(ctor.prototype);
+        ctor.apply(obj, arguments);
+        return obj;
+    };
 }
 
 function createProxy(host, target, options, map) {
@@ -96,17 +144,25 @@ function createProxy(host, target, options, map) {
             if (CtorProxy) {
                 return new CtorProxy(obj);
             }
+            if (host.context) {
+                return translateNativeObject(obj, global, host.context) || obj;
+            }
         }
         return obj;
     }
 
     function unwrapObject(obj) {
-        if (obj && (typeof obj === 'object' || typeof obj === 'function') && hasOwnProperty(obj, '__proxyTarget__')) {
-            try {
-                internalAccess = true;
-                return obj.__proxyTarget__;
-            } finally {
-                internalAccess = false;
+        if (obj && (typeof obj === 'object' || typeof obj === 'function')) {
+            if (hasOwnProperty(obj, '__proxyTarget__')) {
+                try {
+                    internalAccess = true;
+                    return obj.__proxyTarget__;
+                } finally {
+                    internalAccess = false;
+                }
+            }
+            if (host.context) {
+                return translateNativeObject(obj, host.context, global) || obj;
             }
         }
         return obj;
@@ -167,6 +223,7 @@ function createProxy(host, target, options, map) {
         if (dontProxy(ctor)) {
             throw new TypeError('Constructor \'' + name + '\' cannot be proxied');
         }
+        var ctorApply = createCtorApply(ctor);
         var CtorProxy = createNamedFunction(name, function () {
             host.throwIfTerminated();
             var target, map;
@@ -176,13 +233,12 @@ function createProxy(host, target, options, map) {
                 // sandbox created instance must be weak-referenced
                 var args = slice.apply(null, arguments);
                 if (options.new) {
-                    var value = options.new(name, ctor, args, undef);
+                    var value = options.new(name, ctorApply, args, undef, undef);
                     if (value !== undefined) {
                         return wrapObject(undef.unwrap(value));
                     }
                 }
-                target = Object.create(ctor.prototype);
-                ctor.apply(target, args);
+                target = ctorApply.apply(null, args);
             } else {
                 // called internally with existing instance outside
                 // second parameter is the preferred map if supplied
@@ -190,7 +246,7 @@ function createProxy(host, target, options, map) {
                 map = arguments.length > 1 && arguments[1];
             }
             defineProperties(this, target, map, name + '#');
-        });
+        }, wrapObject);
         CtorProxy.prototype = createObject(ctor.prototype, name, map || host._permMap, name + '#');
         defineConstructor(CtorProxy.prototype, CtorProxy);
         defineProperties(CtorProxy, ctor, map || host._permMap, name + '.');
@@ -208,12 +264,12 @@ function createProxy(host, target, options, map) {
             var args = slice.apply(null, arguments).map(function (v) {
                 v = argsIn(v);
                 if (typeof v === 'function') {
-                    return function () {
+                    return createNamedFunction(v.name, function () {
                         host.throwIfTerminated();
                         var context = argsOut(this);
                         var args = slice.apply(null, arguments).map(argsOut);
                         return argsIn(v.apply(context, args));
-                    };
+                    }, argsIn);
                 }
                 return v;
             });
@@ -224,7 +280,7 @@ function createProxy(host, target, options, map) {
                 }
             }
             return argsOut(fn.apply(context, args));
-        });
+        }, argsOut);
     }
 
     function createInFunction(name, fn) {
@@ -237,9 +293,9 @@ function createProxy(host, target, options, map) {
 
     function createGetter(name, obj, map) {
         var prop = name.replace(reBeforeDot, '');
-        var assert = createAssertion(name);
+        var assert = createAssertion(name, 'Access to property %s is blocked');
         var freeze = options.freeze === true || (Array.isArray(options.freeze) && options.freeze.indexOf(name) >= 0);
-        return function () {
+        return createNamedFunction(prop, function () {
             host.throwIfTerminated();
             assert();
             var value = obj[prop];
@@ -253,14 +309,14 @@ function createProxy(host, target, options, map) {
                 return freezeObject(value, map);
             }
             return wrapObject(value);
-        };
+        }, wrapObject);
     }
 
     function createSetter(name, obj, map) {
         var prop = name.replace(reBeforeDot, '');
-        var assert = createAssertion(name);
+        var assert = createAssertion(name, 'Access to property %s is blocked');
         var freeze = options.freeze === true || (Array.isArray(options.freeze) && options.freeze.indexOf(name) >= 0);
-        return function (value) {
+        return createNamedFunction(prop, function (value) {
             host.throwIfTerminated();
             assert();
             if (!freeze) {
@@ -274,7 +330,7 @@ function createProxy(host, target, options, map) {
                 }
                 obj[prop] = value;
             }
-        };
+        }, wrapObject);
     }
 
     function defineProperty(proxy, target, prop, descriptor, map, ns) {

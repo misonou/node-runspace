@@ -12,6 +12,7 @@ var util = require('util');
 var vm = require('vm');
 
 var ModuleLoader = require('./module-loader');
+var EventManager = require('./event-manager');
 var Proxy = require('./proxy');
 var Map = require('./map');
 var WeakMap = require('./weak-map');
@@ -39,32 +40,66 @@ Array.prototype.push.apply(PROCESS_DENY, Object.getOwnPropertyNames(process).fil
     return v.charAt(0) === '_';
 }));
 
-var fsArgCheck = {};
+var FS_ARG_CHECK = {};
 Object.getOwnPropertyNames(fs).forEach(function (i) {
     var checkArg1 = i.charAt(0) !== 'f' && ['read', 'readSync', 'write', 'writeSync'].indexOf(i) < 0;
     var checkArg2 = checkArg1 && ['rename', 'renameSync', 'link', 'linkSync'].indexOf(i) >= 0;
-    fsArgCheck[i] = (checkArg1 && 1) | (checkArg2 && 2);
+    FS_ARG_CHECK[i] = (checkArg1 && 1) | (checkArg2 && 2);
 });
-
-function clearArray(arr) {
-    arr.splice(0, arr.length);
-}
 
 function isContained(basedir, dirname) {
     return path.relative(basedir, dirname).indexOf('..' + path.sep) < 0;
 }
 
-function throwError(code, message) {
-    var err = new Error(util.format.apply(null, Array.prototype.slice.call(arguments, 1)));
-    err.code = code;
-    throw err;
-}
-
 function throwIfEAcces(basedir, filename) {
     filename = path.resolve(filename);
     if (!isContained(basedir, filename)) {
-        throwError('EACCES', 'Access to %s is blocked', filename);
+        var err = new Error(util.format('Access to %s is blocked', filename));
+        err.code = 'EACCES';
+        throw err;
     }
+}
+
+function removeItem(arr, value) {
+    var idx = arr.indexOf(value);
+    if (idx >= 0) {
+        return arr.splice(idx, 1)[0];
+    }
+}
+
+function clear(obj, callback) {
+    if (Array.isArray(obj)) {
+        obj.splice(0).forEach(callback);
+    } else {
+        Object.getOwnPropertyNames(obj).forEach(function (i) {
+            callback(obj[i], i);
+            delete obj[i];
+        });
+    }
+}
+
+function networkIOProxyCall(closeables) {
+    return function (method, fn, args, target) {
+        if (method === 'createServer' || method === 'createSocket') {
+            var server = fn.apply(target, args);
+            if (server.unref) {
+                server.unref();
+            }
+            closeables.push(server);
+            return server;
+        }
+        if (method === 'connect' || method === 'createConnection' || method === 'Socket') {
+            var socket = fn.apply(target, args);
+            socket.close = socket.end;
+            socket.unref();
+            closeables.push(socket);
+            return socket;
+        }
+        if (method === 'Server#close' || method === 'Socket#close' || method === 'Socket#end') {
+            removeItem(closeables, target);
+            return;
+        }
+    };
 }
 
 function Pipe() {
@@ -105,12 +140,9 @@ function Runspace(scope, options) {
     });
 
     var processEE = new EventEmitter();
-    var listeners = new Map();
-    var timerCallbacks = {
-        immediate: [],
-        interval: [],
-        timeout: []
-    };
+    var events = new EventManager();
+    var closeables = [];
+
     var stdin = new Pipe();
     var stdout = new Pipe();
     var stderr = new Pipe();
@@ -124,67 +156,49 @@ function Runspace(scope, options) {
             if (self.isWeaklyProxied(target)) {
                 return;
             }
+            if (method === 'EventEmitter.listenerCount') {
+                target = args.shift();
+                fn = EventEmitter.prototype.listenerCount;
+            }
             if (target === process) {
                 return undef.wrap(fn.apply(processEE, args));
             }
-            if (!listeners.has(target)) {
-                listeners.set(target, []);
-            }
-            var arr = listeners.get(target);
-            var eventType = args[0];
-            var callback = args[1];
-
             switch (method) {
             case 'EventEmitter#on':
             case 'EventEmitter#addListener':
             case 'EventEmitter#once':
-                var callbackProxy = callback;
-                if (method.substr(-4) === 'once') {
-                    callbackProxy = function () {
-                        for (var i = 0, length = arr.length; i < length; i++) {
-                            if (arr[i].callback === callback) {
-                                arr.splice(i, 1);
-                                break;
-                            }
-                        }
-                        callback.apply(this, arguments);
-                    };
+                if (typeof args[1] !== 'function') {
+                    throw new TypeError('listener must be a function');
                 }
-                arr.push({
-                    type: eventType,
-                    callback: callback,
-                    callbackProxy: callbackProxy
-                });
-                return undef.wrap(fn.call(target, eventType, callbackProxy));
+                events.addListener(target, args[0], args[1], method.substr(-4) === 'once');
+                return target;
             case 'EventEmitter#removeListener':
-            case 'EventEmitter#removeAllListener':
-                var checkType = method.indexOf('All') < 0 || eventType;
-                var checkCallback = !!callback;
-                var idx = [];
-                arr.forEach(function (v, i) {
-                    if ((!checkType || v.type === eventType) && (!checkCallback || v.callback === callback)) {
-                        target.removeListener(eventType, v.callbackProxy);
-                        idx.unshift(i);
-                    }
-                });
-                idx.forEach(function (idx) {
-                    arr.splice(idx, 1);
-                });
-                return undef;
+                if (typeof args[1] !== 'function') {
+                    throw new TypeError('listener must be a function');
+                }
+                events.removeListener(target, args[0], args[1]);
+                return target;
+            case 'EventEmitter#removeAllListeners':
+                events.removeAllListeners(target, args[0]);
+                return target;
             case 'EventEmitter#listeners':
-                return arr.filter(function (v) {
-                    return v.type === eventType;
-                }).map(function (v) {
+                return (events.getListeners(target, args[0]) || []).map(function (v) {
                     return v.callback;
                 });
             case 'EventEmitter#listenerCount':
-                return arr.filter(function (v) {
-                    return v.type === eventType;
-                }).length;
+            case 'EventEmitter.listenerCount':
+                return (events.getListeners(target, args[0]) || '').length;
             }
         }
     });
     self.add(stream);
+    self.add(domain);
+
+    var timerCallbacks = {
+        immediate: [],
+        interval: [],
+        timeout: []
+    };
     self.add(setTimeoutCtor, {
         functionType: 'ctor',
         deny: ['#ref']
@@ -193,29 +207,22 @@ function Runspace(scope, options) {
         call: function (method, fn, args, target, undef) {
             var arr = timerCallbacks[method.substr(method.charAt(0) === 's' ? 3 : 5).toLowerCase()];
             if (method.charAt(0) === 's') {
+                var handle;
                 if (method !== 'setInterval') {
                     var callback = args[0];
                     args[0] = function () {
-                        var idx = arr.indexOf(handle);
-                        if (idx >= 0) {
-                            arr.splice(idx, 1);
-                        }
-                        if (callback) {
-                            callback.apply(this, arguments);
-                        }
+                        removeItem(arr, handle);
+                        callback.apply(this, arguments);
                     };
                 }
-                var handle = fn.apply(null, args);
-                if (method !== 'setImmediate') {
+                handle = fn.apply(null, args);
+                if (handle.unref) {
                     handle.unref();
                 }
                 arr.push(handle);
                 return undef.wrap(handle);
             } else {
-                var idx = arr.indexOf(args[0]);
-                if (idx >= 0) {
-                    arr.splice(idx, 1);
-                }
+                removeItem(arr, args[0]);
                 return undef.wrap(fn.apply(null, args));
             }
         }
@@ -246,16 +253,49 @@ function Runspace(scope, options) {
             }
         }
     });
+
+    var watchPaths = Object.create(null);
     self.add(fs, {
         name: 'fs',
-        call: function (method, fn, args) {
-            if (fsArgCheck[method] & 1) {
+        call: function (method, fn, args, target, undef) {
+            if (FS_ARG_CHECK[method] & 1) {
                 args[0] = path.resolve(self.scope, args[0]);
                 throwIfEAcces(self.scope, args[0]);
             }
-            if (fsArgCheck[method] & 2) {
+            if (FS_ARG_CHECK[method] & 2) {
                 args[1] = path.resolve(self.scope, args[1]);
                 throwIfEAcces(self.scope, args[1]);
+            }
+            if (method === 'FSWatcher#close') {
+                removeItem(closeables, target);
+                return;
+            }
+            if (method === 'watch') {
+                if (args[1] && args[1].persistent) {
+                    throw new Error('Persistent FSWatcher disallowed');
+                }
+                var watcher = fn.apply(fs, args);
+                closeables.push(watcher);
+                return watcher;
+            }
+            if (method === 'watchFile') {
+                if (!watchPaths[args[0]]) {
+                    watchPaths[args[0]] = [];
+                }
+                watchPaths[args[0]].push(args[1]);
+                return undef.wrap(fn.apply(fs, args));
+            }
+            if (method === 'unwatchFile') {
+                if (watchPaths[args[0]]) {
+                    if (args[1]) {
+                        removeItem(watchPaths[args[0]], args[1]);
+                        return undef.wrap(fn.apply(fs, args));
+                    }
+                    clear(watchPaths[args[0]], function (v) {
+                        fs.unwatchFile(args[0], v);
+                    });
+                }
+                return undef;
             }
         }
     });
@@ -266,6 +306,31 @@ function Runspace(scope, options) {
                 args.unshift(self.scope);
             }
         }
+    });
+
+    var netProxyCall = networkIOProxyCall(closeables);
+    self.add(require('dgram'), {
+        name: 'dgram',
+        deny: ['Socket#ref'],
+        call: netProxyCall
+    });
+    self.add(require('net'), {
+        name: 'net',
+        deny: ['Server#ref', 'Socket#ref'],
+        call: netProxyCall,
+        new: netProxyCall
+    });
+    self.add(require('tls'), {
+        name: 'tls',
+        call: netProxyCall
+    });
+    self.add(require('http'), {
+        name: 'http',
+        call: netProxyCall
+    });
+    self.add(require('https'), {
+        name: 'https',
+        call: netProxyCall
     });
 
     // setup global context in user-code space
@@ -297,19 +362,18 @@ function Runspace(scope, options) {
     process.on('exit', forwardExit);
     self.once('terminate', function () {
         process.removeListener('exit', forwardExit);
-        timerCallbacks.immediate.forEach(clearImmediate);
-        timerCallbacks.interval.forEach(clearInterval);
-        timerCallbacks.timeout.forEach(clearTimeout);
-        clearArray(timerCallbacks.immediate);
-        clearArray(timerCallbacks.interval);
-        clearArray(timerCallbacks.timeout);
-        listeners.forEach(function (v, target) {
-            v.forEach(function (v) {
-                target.removeListener(v.type, v.callbackProxy);
-            });
-            clearArray(v);
+        events.removeAllListeners();
+        clear(timerCallbacks.immediate, clearImmediate);
+        clear(timerCallbacks.interval, clearInterval);
+        clear(timerCallbacks.timeout, clearTimeout);
+        clear(closeables, function (v) {
+            v.close();
         });
-        listeners.clear();
+        clear(watchPaths, function (arr, i) {
+            clear(arr, function (v) {
+                fs.unwatchFile(i, v);
+            });
+        });
         processEE.emit('exit');
     });
 }
@@ -339,12 +403,14 @@ Runspace.prototype.compile = function (code, filename) {
 
     return {
         run: function (localVars) {
-            Object.keys(localVars || {}).forEach(function (v) {
-                if (argNames.indexOf(v) < 0) {
-                    argNames.push(v);
-                    fn = null;
-                }
-            });
+            if (localVars) {
+                Object.keys(localVars).forEach(function (v) {
+                    if (argNames.indexOf(v) < 0) {
+                        argNames.push(v);
+                        fn = null;
+                    }
+                });
+            }
             if (!fn) {
                 var script = new vm.Script('(function (' + ['require', '__filename', '__dirname'].concat(argNames).join(', ') + ') {' + code + '\n});', filename);
                 fn = self.proxy(script.runInContext(self.context), {

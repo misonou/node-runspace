@@ -1,5 +1,7 @@
 /*jshint node:true */
 
+'use strict';
+
 var builtInModules = require('builtin-modules');
 var fs = require('fs');
 var Module = require('module');
